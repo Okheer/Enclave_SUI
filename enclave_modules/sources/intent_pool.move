@@ -48,6 +48,10 @@ public struct IntentSubmitted has copy, drop {
     min_amount_out: u64,
     deadline_ms: u64,
 }
+public struct IntentFilled has copy, drop {
+    intent_hash: vector<u8>,
+    winner_solver: address,
+}
 
 public struct IntentRefunded has copy, drop {
     intent_hash: vector<u8>,
@@ -136,3 +140,28 @@ public fun refund_expired<CoinIn>(
     transfer::public_transfer(coin::from_balance(coin_in, ctx), user);
 }
 
+public(package) fun consume_intent<CoinIn>(
+    intent: Intent<CoinIn>,
+    winner_solver: address,
+    ctx: &mut TxContext,
+): (address, Coin<CoinIn>, u64, u64, vector<u8>) {
+    let Intent {
+        id, user, coin_in, amount_in, token_in: _, token_out: _,
+        min_amount_out, deadline_ms: _, nonce: _, intent_hash,
+    } = intent;
+
+    object::delete(id);
+    event::emit(IntentFilled { intent_hash, winner_solver });
+
+    (user, coin::from_balance(coin_in, ctx), amount_in, min_amount_out, intent_hash)
+}
+
+// === Read-only accessors (replace getEscrowRecord) ===
+
+public fun user<CoinIn>(intent: &Intent<CoinIn>): address { intent.user }
+public fun amount_in<CoinIn>(intent: &Intent<CoinIn>): u64 { intent.amount_in }
+public fun min_amount_out<CoinIn>(intent: &Intent<CoinIn>): u64 { intent.min_amount_out }
+public fun deadline_ms<CoinIn>(intent: &Intent<CoinIn>): u64 { intent.deadline_ms }
+public fun nonce<CoinIn>(intent: &Intent<CoinIn>): u64 { intent.nonce }
+public fun intent_hash<CoinIn>(intent: &Intent<CoinIn>): vector<u8> { intent.intent_hash }
+public fun token_out<CoinIn>(intent: &Intent<CoinIn>): TypeName { intent.token_out }
