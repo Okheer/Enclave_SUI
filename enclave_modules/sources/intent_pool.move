@@ -3,6 +3,9 @@ module enclave_modules::intent_pool;
 use sui::balance::Balance;
 use sui::coin::{Self, Coin};
 use sui::clock::{Self, Clock};
+use sui::hash;
+use sui::event;
+use std::bcs;
 use std::type_name::{Self, TypeName};
 
 
@@ -34,6 +37,24 @@ public struct Intent<phantom CoinIn> has key {
     intent_hash: vector<u8>,
 }
 
+// === Events ===
+
+public struct IntentSubmitted has copy, drop {
+    intent_hash: vector<u8>,
+    user: address,
+    token_in: TypeName,
+    token_out: TypeName,
+    amount_in: u64,
+    min_amount_out: u64,
+    deadline_ms: u64,
+}
+
+// Error
+const EZeroAmount: u64 = 0;
+const EDeadlinePassed: u64 = 1;
+const EDeadlineNotReached: u64 = 2;
+const ESameToken: u64 = 3;
+
 
 /// @notice Creates a new intent escrow vault and shares it on-chain for solvers to fulfill.
 /// @dev    Direct submission path. The user's transaction signature natively replaces EVM EIP-712 authorization.
@@ -53,7 +74,42 @@ public fun submit_intent<CoinIn, CoinOut>(
     clock: &Clock,
     ctx: &mut TxContext,
 ) {
+     let amount_in = coin::value(&coin_in);
+    assert!(amount_in > 0, EZeroAmount);
+    assert!(clock::timestamp_ms(clock) <= deadline_ms, EDeadlinePassed);
 
+    let token_in = type_name::get<CoinIn>();
+    let token_out = type_name::get<CoinOut>();
+    assert!(token_in != token_out, ESameToken);
+
+    let user = tx_context::sender(ctx);
+    let uid = object::new(ctx);
+
+     let mut buf = object::uid_to_bytes(&uid);
+    vector::append(&mut buf, bcs::to_bytes(&user));
+    vector::append(&mut buf, bcs::to_bytes(&amount_in));
+    vector::append(&mut buf, bcs::to_bytes(&min_amount_out));
+    vector::append(&mut buf, bcs::to_bytes(&deadline_ms));
+    vector::append(&mut buf, bcs::to_bytes(&nonce));
+    let intent_hash = hash::keccak256(&buf);
+
+    event::emit(IntentSubmitted {
+        intent_hash, user, token_in, token_out, amount_in, min_amount_out, deadline_ms,
+    });
+
+
+    transfer::share_object(Intent<CoinIn> {
+        id: uid,
+        user,
+        coin_in: coin::into_balance(coin_in),
+        amount_in,
+        token_in,
+        token_out,
+        min_amount_out,
+        deadline_ms,
+        nonce,
+        intent_hash,
+    });
 }
 
 //Refund
