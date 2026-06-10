@@ -49,6 +49,12 @@ public struct IntentSubmitted has copy, drop {
     deadline_ms: u64,
 }
 
+public struct IntentRefunded has copy, drop {
+    intent_hash: vector<u8>,
+    user: address,
+    amount_in: u64,
+}
+
 // Error
 const EZeroAmount: u64 = 0;
 const EDeadlinePassed: u64 = 1;
@@ -118,6 +124,15 @@ public fun refund_expired<CoinIn>(
     clock: &Clock,
     ctx: &mut TxContext,
 ) {
+  assert!(clock::timestamp_ms(clock) > intent.deadline_ms, EDeadlineNotReached);
 
+    let Intent {
+        id, user, coin_in, amount_in, token_in: _, token_out: _,
+        min_amount_out: _, deadline_ms: _, nonce: _, intent_hash,
+    } = intent;
+
+    object::delete(id);
+    event::emit(IntentRefunded { intent_hash, user, amount_in });
+    transfer::public_transfer(coin::from_balance(coin_in, ctx), user);
 }
 
