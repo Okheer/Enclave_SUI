@@ -56,11 +56,24 @@ public struct SolverRegistry has key {
 
 public struct SolverRegistered has copy, drop { solver: address, tee_pubkey: vector<u8>, stake: u64 }
 public struct SolverKeyRotated has copy, drop { solver: address, new_pubkey: vector<u8> }
+public struct SolverSlashed has copy, drop { solver: address, amount: u64, reason: vector<u8> }
+public struct SolverSuspended has copy, drop { solver: address }
+public struct ReputationUpdated has copy, drop { solver: address, old_rep: u64, new_rep: u64 }
+public struct StakeWithdrawn has copy, drop { solver: address, amount: u64 }
 
 
 // === Init / setup ===
 fun init(ctx: &mut TxContext) {
     transfer::transfer(AdminCap { id: object::new(ctx) }, tx_context::sender(ctx));
+}
+
+public fun create_registry(_: &AdminCap, fee_recipient: address, ctx: &mut TxContext) {
+    transfer::share_object(SolverRegistry {
+        id: object::new(ctx),
+        solvers: table::new(ctx),
+        solver_list: vector::empty(),
+        fee_recipient,
+    });
 }
 
 
@@ -132,3 +145,97 @@ public fun withdraw_stake(registry: &mut SolverRegistry, ctx: &mut TxContext): C
 }
 
 // === Slashing & reputation (package-only — the SETTLER_ROLE equivalent) ===
+public(package) fun slash_solver(
+    registry: &mut SolverRegistry,
+    solver: address,
+    amount: u64,
+    reason: vector<u8>,
+    ctx: &mut TxContext,
+): Coin<SUI> {
+    assert!(table::contains(&registry.solvers, solver), ESolverNotActive);
+    let rec = table::borrow_mut(&mut registry.solvers, solver);
+    assert!(rec.active, ESolverNotActive);
+    assert!(!rec.slashed, ESolverSlashedOut);
+    assert!(amount <= balance::value(&rec.stake), ESlashExceedsStake);
+
+    let slashed_balance = balance::split(&mut rec.stake, amount);
+    event::emit(SolverSlashed { solver, amount, reason });
+
+    if (balance::value(&rec.stake) < MIN_STAKE) {
+        rec.active = false;
+        event::emit(SolverSuspended { solver });
+    };
+    if (balance::value(&rec.stake) == 0) {
+        rec.slashed = true;
+    };
+
+    coin::from_balance(slashed_balance, ctx)
+}
+
+/// R_new = (alpha * accuracy + (1 - alpha) * R_old), same EMA as the
+/// Solidity version, done in u128 to avoid overflow before the final
+/// division back down to u64.
+public(package) fun update_reputation(registry: &mut SolverRegistry, solver: address, accuracy: u64) {
+    assert!(table::contains(&registry.solvers, solver), ESolverNotActive);
+    let rec = table::borrow_mut(&mut registry.solvers, solver);
+    assert!(rec.active, ESolverNotActive);
+
+    let old_rep = rec.reputation;
+    let weighted = (ALPHA_NUM * (accuracy as u128)) + ((ALPHA_DEN - ALPHA_NUM) * (old_rep as u128));
+    let new_rep = (weighted / ALPHA_DEN) as u64;
+
+    rec.reputation = new_rep;
+    event::emit(ReputationUpdated { solver, old_rep, new_rep });
+
+    if (new_rep < REP_SUSPEND_THRESHOLD) {
+        rec.active = false;
+        event::emit(SolverSuspended { solver });
+    };
+}
+
+// === Views ===
+
+public fun is_valid_solver(registry: &SolverRegistry, solver: address, clock: &Clock): bool {
+    if (!table::contains(&registry.solvers, solver)) { return false };
+    let rec = table::borrow(&registry.solvers, solver);
+    rec.active && !rec.slashed && (clock::timestamp_ms(clock) - rec.key_registered_at_ms < KEY_TTL_MS)
+}
+
+public fun get_tee_public_key(registry: &SolverRegistry, solver: address): vector<u8> {
+    table::borrow(&registry.solvers, solver).tee_pubkey
+}
+
+public fun get_reputation(registry: &SolverRegistry, solver: address): u64 {
+    table::borrow(&registry.solvers, solver).reputation
+}
+
+public fun get_stake(registry: &SolverRegistry, solver: address): u64 {
+    balance::value(&table::borrow(&registry.solvers, solver).stake)
+}
+
+public fun fee_recipient(registry: &SolverRegistry): address {
+    registry.fee_recipient
+}
+
+public fun solver_count(registry: &SolverRegistry): u64 {
+    vector::length(&registry.solver_list)
+}
+
+public fun get_solvers(registry: &SolverRegistry, offset: u64, limit: u64): vector<address> {
+    let total = vector::length(&registry.solver_list);
+    let mut result = vector::empty<address>();
+    if (offset >= total || limit == 0) { return result };
+
+    let mut end = offset + limit;
+    if (end > total) { end = total };
+
+    let mut i = offset;
+    while (i < end) {
+        vector::push_back(&mut result, *vector::borrow(&registry.solver_list, i));
+        i = i + 1;
+    };
+    result
+}
+
+#[test_only]
+public fun rep_premium_threshold(): u64 { REP_PREMIUM_THRESHOLD }
