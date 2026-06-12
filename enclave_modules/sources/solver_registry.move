@@ -1,4 +1,5 @@
-module enclave_module::solver_registry;
+#[allow(unused_const)]
+module enclave_modules::solver_registry;
 
 use sui::balance::{Self, Balance};
 use sui::coin::{Self, Coin};
@@ -12,11 +13,10 @@ const MIN_STAKE: u64 = 0;
 const KEY_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 const ALPHA_NUM: u128 = 5;
 const ALPHA_DEN: u128 = 100;
-const REP_SUSPEND_THRESHOLD: u64 = 300; // R < 0.30
-const REP_PREMIUM_THRESHOLD: u64 = 850; // R > 0.85 — defined for parity with
-                                         // the Solidity constant; like the
-                                         // original, nothing gates on it yet.
-const REP_DEFAULT: u64 = 500;
+const REP_SCALE: u64 = 1_000_000_000;
+const REP_SUSPEND_THRESHOLD: u64 = 300_000_000; // R < 0.30
+const REP_PREMIUM_THRESHOLD: u64 = 850_000_000; // R > 0.85 — reserved for Phase-2 fee-tier gating.
+const REP_DEFAULT: u64 = 500_000_000;
 
 // === Errors ===
 const EAlreadyRegistered: u64 = 0;
@@ -30,11 +30,9 @@ const EInsufficientStake: u64 = 5;
 public struct AdminCap has key, store { id: UID }
 
 public struct SolverRecord has store {
-    /// 33-byte COMPRESSED secp256k1 public key. This is the one genuine
-    /// format change from the EVM version, which stored 65-byte
-    /// *uncompressed* keys: Sui's `ecdsa_k1::secp256k1_verify` expects the
-    /// compressed form, so the TEE enclave should emit compressed pubkeys
-    /// when targeting this contract. See `solvex_verifier`.
+    /// 33-byte compressed secp256k1 public key. Sui's `ecdsa_k1::secp256k1_verify`
+    /// expects compressed keys, so the TEE enclave must emit compressed pubkeys
+    /// when targeting this module. See `solvex_verifier`.
     tee_pubkey: vector<u8>,
     key_registered_at_ms: u64,
     stake: Balance<SUI>,
@@ -46,9 +44,9 @@ public struct SolverRecord has store {
 public struct SolverRegistry has key {
     id: UID,
     solvers: Table<address, SolverRecord>,
-    /// Mirrors `solverList` — Table can't be iterated directly in Move, so
-    /// we keep a parallel vector for pagination, same as the Solidity
-    /// version kept an array alongside its mapping for the same reason.
+    /// Parallel vector for paginated iteration. `Table` has no Move-native
+    /// iteration, so a side vector of solver addresses enables paginated reads
+    /// via `get_solvers`.
     solver_list: vector<address>,
     fee_recipient: address,
 }
@@ -71,7 +69,7 @@ public fun create_registry(_: &AdminCap, fee_recipient: address, ctx: &mut TxCon
     transfer::share_object(SolverRegistry {
         id: object::new(ctx),
         solvers: table::new(ctx),
-        solver_list: vector::empty(),
+        solver_list: vector[],
         fee_recipient,
     });
 }
@@ -115,33 +113,38 @@ public fun register_solver(
 
 }
 
-/// @notice Updates the TEE public key for an actively registered solver.
-/// @dev    Reverts if the solver is inactive, slashed, or if the key is not 33 bytes.
-///         Updates the `key_registered_at_ms` timer, which is typically used to enforce grace periods.
-/// @param  registry    The shared `SolverRegistry` state object.
-/// @param  new_pubkey  The new 33-byte compressed secp256k1 public key.
-/// @param  clock       Shared Sui `Clock` object to record the rotation timestamp.
-/// @param  ctx         Transaction context to identify the calling solver.
 public fun rotate_tee_key(
     registry: &mut SolverRegistry,
     new_pubkey: vector<u8>,
     clock: &Clock,
     ctx: &TxContext,
-){
-
+) {
+    let solver = tx_context::sender(ctx);
+    assert!(table::contains(&registry.solvers, solver), ESolverNotActive);
+    let rec = table::borrow_mut(&mut registry.solvers, solver);
+    assert!(rec.active && !rec.slashed, ESolverNotActive);
+    assert!(vector::length(&new_pubkey) == 33, EInvalidPubkey);
+    rec.tee_pubkey = new_pubkey;
+    rec.key_registered_at_ms = clock::timestamp_ms(clock);
+    event::emit(SolverKeyRotated { solver, new_pubkey: rec.tee_pubkey });
 }
 
-/// @notice Allows an active, unslashed solver to increase their locked stake.
-/// @dev    Uses `balance::join` to merge the new deposit directly into the solver's existing stake balance.
-/// @param  registry    The shared `SolverRegistry` state object.
-/// @param  stake       The additional `Coin<SUI>` to add to the locked stake.
-/// @param  ctx         Transaction context to identify the calling solver.
-public fun add_stake(registry: &mut SolverRegistry, stake: Coin<SUI>, ctx: &TxContext){
-
+public fun add_stake(registry: &mut SolverRegistry, stake: Coin<SUI>, ctx: &TxContext) {
+    let solver = tx_context::sender(ctx);
+    let rec = table::borrow_mut(&mut registry.solvers, solver);
+    assert!(rec.active && !rec.slashed, ESolverNotActive);
+    balance::join(&mut rec.stake, coin::into_balance(stake));
 }
 
-public fun withdraw_stake(registry: &mut SolverRegistry, ctx: &mut TxContext): Coin<SUI>{
-
+public fun withdraw_stake(registry: &mut SolverRegistry, ctx: &mut TxContext): Coin<SUI> {
+    let solver = tx_context::sender(ctx);
+    let rec = table::borrow_mut(&mut registry.solvers, solver);
+    assert!(rec.active && !rec.slashed, ESolverNotActive);
+    let amount = balance::value(&rec.stake);
+    let withdrawn = balance::split(&mut rec.stake, amount);
+    rec.active = false;
+    event::emit(StakeWithdrawn { solver, amount });
+    coin::from_balance(withdrawn, ctx)
 }
 
 // === Slashing & reputation (package-only — the SETTLER_ROLE equivalent) ===
@@ -172,9 +175,8 @@ public(package) fun slash_solver(
     coin::from_balance(slashed_balance, ctx)
 }
 
-/// R_new = (alpha * accuracy + (1 - alpha) * R_old), same EMA as the
-/// Solidity version, done in u128 to avoid overflow before the final
-/// division back down to u64.
+/// R_new = (alpha * accuracy + (1 - alpha) * R_old), exponential moving
+/// average computed in u128 to avoid overflow before the final division.
 public(package) fun update_reputation(registry: &mut SolverRegistry, solver: address, accuracy: u64) {
     assert!(table::contains(&registry.solvers, solver), ESolverNotActive);
     let rec = table::borrow_mut(&mut registry.solvers, solver);
@@ -223,7 +225,7 @@ public fun solver_count(registry: &SolverRegistry): u64 {
 
 public fun get_solvers(registry: &SolverRegistry, offset: u64, limit: u64): vector<address> {
     let total = vector::length(&registry.solver_list);
-    let mut result = vector::empty<address>();
+    let mut result = vector[];
     if (offset >= total || limit == 0) { return result };
 
     let mut end = offset + limit;
