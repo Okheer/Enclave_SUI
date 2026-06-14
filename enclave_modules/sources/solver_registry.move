@@ -241,3 +241,13 @@ public fun get_solvers(registry: &SolverRegistry, offset: u64, limit: u64): vect
 
 #[test_only]
 public fun rep_premium_threshold(): u64 { REP_PREMIUM_THRESHOLD }
+
+#[test_only]
+public fun create_registry_for_testing(fee_recipient: address, ctx: &mut TxContext) {
+    transfer::share_object(SolverRegistry {
+        id: object::new(ctx),
+        solvers: table::new(ctx),
+        solver_list: vector[],
+        fee_recipient,
+    });
+}

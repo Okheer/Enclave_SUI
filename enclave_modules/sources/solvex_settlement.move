@@ -221,6 +221,89 @@ public fun slash_non_fill<In, Out>(
     event::emit(SolverSlashedForNonFill { solver: winner_solver, amount: slash_amount });
 }
 
+// === Test-only helpers ===
+
+#[test_only]
+public fun create_attestation(
+    intent_id: ID,
+    winner_solver: address,
+    output_amount: u64,
+    deepbook_pool_id: ID,
+    prev_attestation_hash: vector<u8>,
+    walrus_blob_id: vector<u8>,
+): Attestation {
+    Attestation { intent_id, winner_solver, output_amount, deepbook_pool_id, prev_attestation_hash, walrus_blob_id }
+}
+
+#[test_only]
+public fun create_config_for_testing(fee_recipient: address, ctx: &mut TxContext) {
+    transfer::share_object(SettlementConfig {
+        id: object::new(ctx),
+        fee_recipient,
+        settled: table::new(ctx),
+        auction_results: table::new(ctx),
+        last_attestation_hash: vector[],
+    });
+}
+
+#[test_only]
+public fun settle_intent_with_output<In, Out>(
+    config: &mut SettlementConfig,
+    registry: &mut SolverRegistry,
+    intent: Intent<In, Out>,
+    attestation: Attestation,
+    tee_sig: vector<u8>,
+    coin_out: Coin<Out>,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    assert!(!table::contains(&config.settled, attestation.intent_id), EAlreadySettled);
+
+    assert!(solver_registry::is_valid_solver(registry, attestation.winner_solver, clock), EInvalidSolver);
+
+    assert!(attestation.output_amount > 0, EZeroOutput);
+
+    assert!(attestation.prev_attestation_hash == config.last_attestation_hash, EChainBroken);
+
+    let attestation_bytes = bcs::to_bytes(&attestation);
+    let tee_pubkey = solver_registry::get_tee_public_key(registry, attestation.winner_solver);
+    assert!(solvex_verifier::verify_attestation(attestation_bytes, tee_sig, tee_pubkey), EAttestationVerificationFailed);
+
+    let dline = intent_pool::deadline_ms(&intent);
+    assert!(clock::timestamp_ms(clock) <= dline, EIntentExpired);
+
+    let (intent_id, user, coin_in, _amount_in, min_amount_out, _hash) =
+        intent_pool::consume_intent(intent, attestation.winner_solver, ctx);
+    assert!(intent_id == attestation.intent_id, EAlreadySettled);
+    coin::burn_for_testing(coin_in);
+
+    let coin_out_value = coin::value(&coin_out);
+    assert!(coin_out_value >= min_amount_out, EOutputBelowMinimum);
+
+    table::add(&mut config.settled, attestation.intent_id, true);
+
+    let att_hash = hash::keccak256(&attestation_bytes);
+    config.last_attestation_hash = att_hash;
+
+    let mut accuracy = (((attestation.output_amount as u128) * (MAX_ACCURACY as u128)) / (min_amount_out as u128)) as u64;
+    if (accuracy > MAX_ACCURACY) { accuracy = MAX_ACCURACY };
+    solver_registry::update_reputation(registry, attestation.winner_solver, accuracy);
+
+    event::emit(AttestationVerified {
+        intent_id: attestation.intent_id,
+        attestation_hash: att_hash,
+        winner_solver: attestation.winner_solver,
+    });
+    event::emit(IntentSettled {
+        intent_id: attestation.intent_id,
+        solver: attestation.winner_solver,
+        output_amount: coin_out_value,
+        walrus_blob_id: attestation.walrus_blob_id,
+    });
+
+    transfer::public_transfer(coin_out, user);
+}
+
 // === Views ===
 
 public fun is_settled(config: &SettlementConfig, intent_id: ID): bool {
