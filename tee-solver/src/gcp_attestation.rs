@@ -1,4 +1,4 @@
-//! GCP Confidential Space Attestation (SyndDB-style)
+
 //!
 //! In production (GCP Confidential Space), this module fetches a real OIDC JWT
 //! from the GCP metadata endpoint. The JWT cryptographically binds:
